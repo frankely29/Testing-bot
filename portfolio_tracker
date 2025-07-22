@@ -1,0 +1,127 @@
+# core/portfolio_tracker.py
+"""
+Single source of truth for portfolio fetching from Coinbase - PRICE FETCH FIXED
+"""
+
+from decimal import Decimal
+import logging
+from coinbase.rest import RESTClient
+
+def apply_symbol_mapping(symbol, mappings=None):
+    """Apply symbol mappings (e.g., MATIC -> POL)"""
+    if not mappings:
+        mappings = {
+            "MATIC-USD": "POL-USD",
+            "MATIC": "POL"
+        }
+    return mappings.get(symbol, symbol)
+
+def safe_fetch_close(cb, symbol):
+    """Safely fetch current price with symbol mapping - FIXED VERSION"""
+    symbol = apply_symbol_mapping(symbol)
+    
+    # Skip invalid products
+    invalid_products = {"USDC-USD", "DAI-USD", "TUSD-USD", "WUSD-USD"}
+    if symbol in invalid_products:
+        return Decimal("0")
+    
+    try:
+        # Try rate limiting if available
+        try:
+            from utils.api_utils import rate_limit_api_call
+            rate_limit_api_call()
+        except ImportError:
+            pass
+        
+        # METHOD 1: Try get_product_book (most reliable)
+        try:
+            book_response = cb.get_product_book(product_id=symbol, limit=1)
+            book_data = book_response.to_dict() if hasattr(book_response, 'to_dict') else book_response
+            
+            if isinstance(book_data, dict):
+                bids = book_data.get('bids', [])
+                asks = book_data.get('asks', [])
+                
+                if bids and asks:
+                    best_bid = Decimal(str(bids[0]['price']))
+                    best_ask = Decimal(str(asks[0]['price']))
+                    mid_price = (best_bid + best_ask) / 2
+                    if mid_price > 0:
+                        logging.debug(f"Got price for {symbol}: ${mid_price:.4f} (via order book)")
+                        return mid_price
+        except Exception as e:
+            logging.debug(f"Order book method failed for {symbol}: {e}")
+        
+        # METHOD 2: Try candles as fallback
+        try:
+            from core.data_feed import fetch_live_candles
+            
+            candles = fetch_live_candles(cb, symbol, "ONE_HOUR", 1)
+            if not candles.empty and 'close' in candles:
+                price = Decimal(str(candles['close'].iloc[-1]))
+                if price > 0:
+                    logging.debug(f"Got price for {symbol}: ${price:.4f} (via candles)")
+                    return price
+        except Exception as e:
+            logging.debug(f"Candles method failed for {symbol}: {e}")
+            
+    except Exception as e:
+        logging.error(f"Failed to fetch price for {symbol}: {e}")
+    
+    logging.warning(f"Could not get price for {symbol} - all methods failed")
+    return Decimal("0")
+
+def get_portfolio(cb):
+    """
+    Get portfolio with proper error handling and decimal math
+    Returns: (portfolio_list, total_usd_value)
+    Where portfolio_list is [(currency, balance, usd_value), ...]
+    """
+    try:
+        accounts_response = cb.get_accounts()
+        accounts_data = accounts_response.to_dict() if hasattr(accounts_response, 'to_dict') else accounts_response
+        
+        accounts = accounts_data.get("accounts", []) if isinstance(accounts_data, dict) else []
+        portfolio = []
+        total = Decimal("0")
+        
+        for account in accounts:
+            currency = account["currency"]
+            balance = Decimal(str(account["available_balance"]["value"]))
+            
+            if balance > 0:
+                # Apply symbol mapping
+                mapped_currency = apply_symbol_mapping(currency)
+                
+                if currency in ["USD", "USDC"]:
+                    usd_value = balance
+                else:
+                    symbol = f"{mapped_currency}-USD"
+                    price = safe_fetch_close(cb, symbol)
+                    usd_value = balance * price if price > 0 else Decimal("0")
+                
+                portfolio.append((currency, float(balance), float(usd_value)))
+                total += usd_value
+        
+        logging.info(f"Portfolio fetched: {len(portfolio)} assets, total ${total:.2f}")
+        return portfolio, float(total)
+        
+    except Exception as e:
+        logging.error(f"Failed to get portfolio: {e}")
+        return [], 0
+
+def get_cash_balance(cb):
+    """
+    Get current cash balance (USD + USDC)
+    Convenience function for getting deployable cash
+    """
+    try:
+        portfolio, _ = get_portfolio(cb)
+        cash = Decimal("0")
+        for currency, _, usd_value in portfolio:
+            if currency in ["USD", "USDC"]:
+                cash += Decimal(str(usd_value))
+        return cash
+    except Exception as e:
+        logging.error(f"Failed to get cash balance: {e}")
+        return Decimal("0")
